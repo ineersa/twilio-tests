@@ -8,5 +8,6 @@ dependencies = [
     "fastapi",
     "openai",
     "python-dotenv",
+    "twilio>=9.10.2",
     "uvicorn[standard]",
 ]
