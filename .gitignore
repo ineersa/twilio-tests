@@ -11,3 +11,5 @@ wheels/
 
 # Local secrets (tracked examples remain in .env)
 .env.local
+.idea
+/docs

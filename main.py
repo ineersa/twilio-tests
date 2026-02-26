@@ -1,9 +1,7 @@
 import json
 import logging
 import os
-from collections import deque
 from functools import partial
-from time import monotonic
 from typing import Any
 from urllib.parse import parse_qsl
 
@@ -40,9 +38,6 @@ app = FastAPI(title="Twilio ConversationRelay with FastAPI")
 # In-memory questionnaire state keyed by Twilio callSid.
 call_states: dict[str, dict[str, object]] = {}
 compliance_clients: set[WebSocket] = set()
-RECENT_TRANSCRIPT_TTL_SECONDS = 3.0
-_recent_transcript_keys: deque[tuple[float, str]] = deque()
-_recent_transcript_key_set: set[str] = set()
 
 def require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -112,52 +107,6 @@ async def _broadcast_to_compliance(payload: dict[str, Any]) -> int:
     return delivered_clients
 
 
-def _extract_transcript_text(payload: dict[str, Any]) -> str:
-    transcription_data = payload.get("TranscriptionData")
-
-    if isinstance(transcription_data, dict):
-        transcript = transcription_data.get("transcript", "")
-        return str(transcript)
-
-    if isinstance(transcription_data, str):
-        try:
-            parsed_data = json.loads(transcription_data)
-        except json.JSONDecodeError:
-            return transcription_data
-
-        if isinstance(parsed_data, dict):
-            transcript = parsed_data.get("transcript", "")
-            return str(transcript)
-        return str(parsed_data)
-
-    return ""
-
-
-def _is_duplicate_transcription_content(payload: dict[str, Any]) -> bool:
-    if payload.get("TranscriptionEvent") != "transcription-content":
-        return False
-
-    if str(payload.get("Final", "")).lower() == "false":
-        return False
-
-    transcript = _extract_transcript_text(payload)
-    normalized_transcript = " ".join(transcript.strip().lower().split())
-    if not normalized_transcript:
-        return False
-
-    now = monotonic()
-    while _recent_transcript_keys and now - _recent_transcript_keys[0][0] > RECENT_TRANSCRIPT_TTL_SECONDS:
-        _, expired_key = _recent_transcript_keys.popleft()
-        _recent_transcript_key_set.discard(expired_key)
-
-    if normalized_transcript in _recent_transcript_key_set:
-        return True
-
-    _recent_transcript_keys.append((now, normalized_transcript))
-    _recent_transcript_key_set.add(normalized_transcript)
-    return False
-
-
 @app.get("/twiml")
 async def twiml() -> Response:
     body = (
@@ -174,13 +123,23 @@ async def twiml() -> Response:
 @app.post("/transcription")
 async def transcription_webhook(request: Request) -> dict[str, object]:
     payload = await _parse_transcription_payload(request)
-    if _is_duplicate_transcription_content(payload):
-        logger.info("Transcription webhook duplicate skipped payload=%s", payload)
+    if payload.get("Track") != "inbound_track":
+        logger.info("Transcription webhook skipped non-inbound payload=%s", payload)
         return {"ok": True, "delivered_clients": 0}
 
     delivered_clients = await _broadcast_to_compliance(payload)
 
     logger.info("Transcription webhook payload=%s", payload)
+
+    return {"ok": True, "delivered_clients": delivered_clients}
+
+
+@app.post("/summary")
+async def summary_webhook(request: Request) -> dict[str, object]:
+    payload = await _parse_transcription_payload(request)
+    delivered_clients = await _broadcast_to_compliance(payload)
+
+    logger.info("Summary webhook payload=%s", payload)
 
     return {"ok": True, "delivered_clients": delivered_clients}
 
