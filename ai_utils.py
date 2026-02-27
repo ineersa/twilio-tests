@@ -13,6 +13,87 @@ ALLOWED_DATA_CENTER_COMPANIES = [
 ]
 
 
+def classify_transcription_compliance(
+    client: OpenAI,
+    model: str,
+    transcript_text: str,
+) -> tuple[bool, list[str]]:
+    cleaned_transcript = transcript_text.strip()
+    if not cleaned_transcript:
+        return False, []
+
+    system_prompt = (
+        "You are a strict compliance classifier for call transcript snippets. "
+        "Detect whether the transcript contains prohibited topics.\n\n"
+        "Prohibited topics:\n"
+        "1) Medical & Symptom Concepts:\n"
+        "- Symptoms: headache, back pain, inflammation\n"
+        "- Conditions: arthritis, chronic pain, migraine\n"
+        "- Use cases: acute pain, long-term use\n"
+        "2) Scientific & Development Concepts:\n"
+        "- Mechanism of action\n"
+        "- Dose ceiling\n"
+        "- Efficacy\n"
+        "- Clinical claims\n"
+        "3) Financial / Planning Concepts:\n"
+        "- Margin\n"
+        "- Costs\n"
+        "- Pricing\n"
+        "- Forecasts\n"
+        "4) Proper nouns:\n"
+        "- Company names\n"
+        "- Product names\n\n"
+        "Return JSON only with keys: is_compliance_violation, compliance_violations.\n"
+        "Rules:\n"
+        "- Set is_compliance_violation=true only when the transcript mentions a prohibited topic.\n"
+        "- compliance_violations must be an array of exact words/phrases copied from the transcript.\n"
+        "- If there is no violation, return false and an empty array.\n"
+        "- Do not include any keys besides is_compliance_violation and compliance_violations."
+    )
+    user_prompt = f"Transcript:\n{cleaned_transcript}"
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format={"type": "json_object"},
+    )
+    content = completion.choices[0].message.content or "{}"
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return False, []
+
+    is_compliance_violation = bool(parsed.get("is_compliance_violation", False))
+    raw_violations = parsed.get("compliance_violations")
+    if not isinstance(raw_violations, list):
+        return False, []
+
+    transcript_lower = cleaned_transcript.lower()
+    seen: set[str] = set()
+    compliance_violations: list[str] = []
+    for item in raw_violations:
+        if not isinstance(item, str):
+            continue
+        candidate = item.strip()
+        if not candidate:
+            continue
+        # Keep only phrases that appear in transcript to reduce hallucinated matches.
+        if candidate.lower() not in transcript_lower:
+            continue
+        dedupe_key = candidate.lower()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        compliance_violations.append(candidate)
+
+    if not compliance_violations:
+        return False, []
+
+    return is_compliance_violation or bool(compliance_violations), compliance_violations
+
+
 def stream_ai_response(
     client: OpenAI, model: str, messages: Sequence[dict[str, str]]
 ) -> Generator[str]:

@@ -11,7 +11,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from openai import OpenAI
 
-from ai_utils import validate_questionnaire_answer
+from ai_utils import classify_transcription_compliance, validate_questionnaire_answer
 from relay_handlers import (
     cleanup_session,
     handle_interrupt_message,
@@ -53,6 +53,7 @@ OPENAI_API_KEY = require_env("OPENAI_API_KEY")
 WS_URL = f"wss://{DOMAIN}/ws"
 client = OpenAI(api_key=OPENAI_API_KEY)
 answer_validator = partial(validate_questionnaire_answer, client, OPENAI_MODEL)
+compliance_classifier = partial(classify_transcription_compliance, client, OPENAI_MODEL)
 
 
 async def _parse_transcription_payload(request: Request) -> dict[str, Any]:
@@ -107,6 +108,21 @@ async def _broadcast_to_compliance(payload: dict[str, Any]) -> int:
     return delivered_clients
 
 
+def _extract_transcript_text(payload: dict[str, Any]) -> str:
+    transcription_data = payload.get("TranscriptionData")
+    if isinstance(transcription_data, str):
+        try:
+            transcription_data = json.loads(transcription_data)
+        except json.JSONDecodeError:
+            return ""
+    if not isinstance(transcription_data, dict):
+        return ""
+    transcript = transcription_data.get("transcript")
+    if not isinstance(transcript, str):
+        return ""
+    return transcript.strip()
+
+
 @app.get("/twiml")
 async def twiml() -> Response:
     body = (
@@ -127,9 +143,26 @@ async def transcription_webhook(request: Request) -> dict[str, object]:
         logger.info("Transcription webhook skipped non-inbound payload=%s", payload)
         return {"ok": True, "delivered_clients": 0}
 
-    delivered_clients = await _broadcast_to_compliance(payload)
+    enriched_payload = dict(payload)
+    is_compliance_violation = False
+    compliance_violations: list[str] = []
+    transcript_text = _extract_transcript_text(payload)
+    if transcript_text:
+        try:
+            is_compliance_violation, compliance_violations = compliance_classifier(
+                transcript_text
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Compliance classification failed for payload=%s", payload)
+    else:
+        logger.warning("Transcription payload missing transcript text: %s", payload)
 
-    logger.info("Transcription webhook payload=%s", payload)
+    enriched_payload["IsComplianceViolation"] = is_compliance_violation
+    enriched_payload["ComplianceViolations"] = compliance_violations
+
+    delivered_clients = await _broadcast_to_compliance(enriched_payload)
+
+    logger.info("Transcription webhook payload=%s", enriched_payload)
 
     return {"ok": True, "delivered_clients": delivered_clients}
 
