@@ -17,40 +17,59 @@ def classify_transcription_compliance(
     client: OpenAI,
     model: str,
     transcript_text: str,
+    recent_transcripts: Sequence[str] | None = None,
 ) -> tuple[bool, list[str]]:
     cleaned_transcript = transcript_text.strip()
     if not cleaned_transcript:
         return False, []
 
+    cleaned_context = [
+        snippet.strip()
+        for snippet in (recent_transcripts or [])
+        if isinstance(snippet, str) and snippet.strip()
+    ]
+    context_block = "\n".join(
+        f"{index}. {snippet}" for index, snippet in enumerate(cleaned_context, start=1)
+    )
+
     system_prompt = (
         "You are a strict compliance classifier for call transcript snippets. "
-        "Detect whether the transcript contains prohibited topics.\n\n"
+        "Detect whether the transcript contains prohibited topics.\n"
+        "The topic examples below are illustrative and non-exhaustive. "
+        "You must generalize to similar terms (for example, acne treatment should be treated as a medical/treatment concept).\n\n"
         "Prohibited topics:\n"
         "1) Medical & Symptom Concepts:\n"
-        "- Symptoms: headache, back pain, inflammation\n"
-        "- Conditions: arthritis, chronic pain, migraine\n"
-        "- Use cases: acute pain, long-term use\n"
+        "- Any symptoms (e.g., headache, back pain, inflammation)\n"
+        "- Any conditions/diseases (e.g., arthritis, chronic pain, migraine, acne)\n"
+        "- Any treatment/use-case discussion (e.g., acute pain, long-term use, treatment plans)\n"
         "2) Scientific & Development Concepts:\n"
-        "- Mechanism of action\n"
-        "- Dose ceiling\n"
-        "- Efficacy\n"
-        "- Clinical claims\n"
+        "- Mechanism of action or how a product works\n"
+        "- Dose ceiling, dosing limits, dosage guidance\n"
+        "- Efficacy/effectiveness claims\n"
+        "- Clinical claims, study/trial results, comparative claims\n"
         "3) Financial / Planning Concepts:\n"
-        "- Margin\n"
-        "- Costs\n"
-        "- Pricing\n"
-        "- Forecasts\n"
+        "- Margin, profitability\n"
+        "- Costs, budget, spend\n"
+        "- Pricing, discounts, monetization\n"
+        "- Forecasts, projections, revenue planning\n"
         "4) Proper nouns:\n"
         "- Company names\n"
-        "- Product names\n\n"
+        "- Product names\n"
+        "- Competitor names\n\n"
         "Return JSON only with keys: is_compliance_violation, compliance_violations.\n"
         "Rules:\n"
-        "- Set is_compliance_violation=true only when the transcript mentions a prohibited topic.\n"
+        "- Classify the current transcript snippet using prior snippets only as supporting context.\n"
+        "- If prior context has violations but current snippet is unrelated, return false.\n"
+        "- Set is_compliance_violation=true only when the current snippet conveys a prohibited topic.\n"
         "- compliance_violations must be an array of exact words/phrases copied from the transcript.\n"
         "- If there is no violation, return false and an empty array.\n"
         "- Do not include any keys besides is_compliance_violation and compliance_violations."
     )
-    user_prompt = f"Transcript:\n{cleaned_transcript}"
+    user_prompt = (
+        f"Current transcript snippet:\n{cleaned_transcript}\n\n"
+        "Recent prior transcript snippets (oldest to newest):\n"
+        f"{context_block or 'none'}"
+    )
     completion = client.chat.completions.create(
         model=model,
         messages=[
@@ -70,7 +89,7 @@ def classify_transcription_compliance(
     if not isinstance(raw_violations, list):
         return False, []
 
-    transcript_lower = cleaned_transcript.lower()
+    validation_source = "\n".join([cleaned_transcript, *cleaned_context]).lower()
     seen: set[str] = set()
     compliance_violations: list[str] = []
     for item in raw_violations:
@@ -79,8 +98,8 @@ def classify_transcription_compliance(
         candidate = item.strip()
         if not candidate:
             continue
-        # Keep only phrases that appear in transcript to reduce hallucinated matches.
-        if candidate.lower() not in transcript_lower:
+        # Keep only phrases that appear in provided transcript context to reduce hallucinations.
+        if candidate.lower() not in validation_source:
             continue
         dedupe_key = candidate.lower()
         if dedupe_key in seen:

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from collections import deque
 from functools import partial
 from typing import Any
 from urllib.parse import parse_qsl
@@ -38,6 +39,7 @@ app = FastAPI(title="Twilio ConversationRelay with FastAPI")
 # In-memory questionnaire state keyed by Twilio callSid.
 call_states: dict[str, dict[str, object]] = {}
 compliance_clients: set[WebSocket] = set()
+inbound_transcript_context: dict[str, deque[str]] = {}
 
 def require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -143,6 +145,15 @@ async def transcription_webhook(request: Request) -> dict[str, object]:
         logger.info("Transcription webhook skipped non-inbound payload=%s", payload)
         return {"ok": True, "delivered_clients": 0}
 
+    call_sid = str(payload.get("CallSid", "")).strip()
+    context_window: list[str] = []
+    if call_sid:
+        call_context = inbound_transcript_context.get(call_sid)
+        if call_context is None:
+            call_context = deque(maxlen=3)
+            inbound_transcript_context[call_sid] = call_context
+        context_window = list(call_context)
+
     enriched_payload = dict(payload)
     is_compliance_violation = False
     compliance_violations: list[str] = []
@@ -150,7 +161,8 @@ async def transcription_webhook(request: Request) -> dict[str, object]:
     if transcript_text:
         try:
             is_compliance_violation, compliance_violations = compliance_classifier(
-                transcript_text
+                transcript_text,
+                context_window,
             )
         except Exception:  # noqa: BLE001
             logger.exception("Compliance classification failed for payload=%s", payload)
@@ -162,6 +174,9 @@ async def transcription_webhook(request: Request) -> dict[str, object]:
 
     delivered_clients = await _broadcast_to_compliance(enriched_payload)
 
+    if transcript_text and call_sid:
+        inbound_transcript_context[call_sid].append(transcript_text)
+
     logger.info("Transcription webhook payload=%s", enriched_payload)
 
     return {"ok": True, "delivered_clients": delivered_clients}
@@ -171,6 +186,10 @@ async def transcription_webhook(request: Request) -> dict[str, object]:
 async def summary_webhook(request: Request) -> dict[str, object]:
     payload = await _parse_transcription_payload(request)
     delivered_clients = await _broadcast_to_compliance(payload)
+
+    call_sid = str(payload.get("CallSid", "")).strip()
+    if call_sid:
+        inbound_transcript_context.pop(call_sid, None)
 
     logger.info("Summary webhook payload=%s", payload)
 
