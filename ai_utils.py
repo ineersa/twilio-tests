@@ -17,20 +17,10 @@ def classify_transcription_compliance(
     client: OpenAI,
     model: str,
     transcript_text: str,
-    recent_transcripts: Sequence[str] | None = None,
 ) -> tuple[bool, list[str]]:
     cleaned_transcript = transcript_text.strip()
     if not cleaned_transcript:
         return False, []
-
-    cleaned_context = [
-        snippet.strip()
-        for snippet in (recent_transcripts or [])
-        if isinstance(snippet, str) and snippet.strip()
-    ]
-    context_block = "\n".join(
-        f"{index}. {snippet}" for index, snippet in enumerate(cleaned_context, start=1)
-    )
 
     system_prompt = (
         "You are a strict compliance classifier for call transcript snippets. "
@@ -58,18 +48,12 @@ def classify_transcription_compliance(
         "- Competitor names\n\n"
         "Return JSON only with keys: is_compliance_violation, compliance_violations.\n"
         "Rules:\n"
-        "- Classify the current transcript snippet using prior snippets only as supporting context.\n"
-        "- If prior context has violations but current snippet is unrelated, return false.\n"
-        "- Set is_compliance_violation=true only when the current snippet conveys a prohibited topic.\n"
+        "- Set is_compliance_violation=true only when the provided transcript snippet conveys a prohibited topic.\n"
         "- compliance_violations must be an array of exact words/phrases copied from the transcript.\n"
         "- If there is no violation, return false and an empty array.\n"
         "- Do not include any keys besides is_compliance_violation and compliance_violations."
     )
-    user_prompt = (
-        f"Current transcript snippet:\n{cleaned_transcript}\n\n"
-        "Recent prior transcript snippets (oldest to newest):\n"
-        f"{context_block or 'none'}"
-    )
+    user_prompt = f"Transcript snippet:\n{cleaned_transcript}"
     completion = client.chat.completions.create(
         model=model,
         messages=[
@@ -89,7 +73,7 @@ def classify_transcription_compliance(
     if not isinstance(raw_violations, list):
         return False, []
 
-    validation_source = "\n".join([cleaned_transcript, *cleaned_context]).lower()
+    validation_source = cleaned_transcript.lower()
     seen: set[str] = set()
     compliance_violations: list[str] = []
     for item in raw_violations:
@@ -98,7 +82,7 @@ def classify_transcription_compliance(
         candidate = item.strip()
         if not candidate:
             continue
-        # Keep only phrases that appear in provided transcript context to reduce hallucinations.
+        # Keep only phrases that appear in the current transcript to reduce hallucinations.
         if candidate.lower() not in validation_source:
             continue
         dedupe_key = candidate.lower()
